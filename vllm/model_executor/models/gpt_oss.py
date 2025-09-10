@@ -312,7 +312,7 @@ class GptOssModel(nn.Module):
                 continue
 
             # FIXME(woosuk): Remove this after testing.
-            weight = weight.cuda()
+            weight = weight.xpu()
 
             if ".w13_weight_scale" in name:
                 # Handle MLP gate and up projection weights scale

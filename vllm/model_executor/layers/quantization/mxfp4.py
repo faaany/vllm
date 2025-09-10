@@ -421,7 +421,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             del layer.w2_weight
             layer.w13_weight = None
             layer.w2_weight = None
-            torch.cuda.empty_cache()
+            torch.xpu.empty_cache()
 
     def _get_tile_tokens_dim(self, x: torch.Tensor, top_k: int):
         # Number of tokens in the input tensor.
@@ -682,3 +682,4 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_precision=self.w2_precision_config,
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
+            # return x

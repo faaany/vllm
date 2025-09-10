@@ -273,6 +273,7 @@ class ipex_ops:
         num_splits=0,
         s_aux: Optional[torch.Tensor] = None,
     ):
+        print("#############inside flash attn verlen func")
         if cu_seqlens_k is None:
             # cu_seqlens_k is not used in ipex kernel.
             cu_seqlens_k = torch.cumsum(seqused_k, dim=0)
@@ -305,7 +306,7 @@ class ipex_ops:
             window_size_right=real_window_size[1],
             k_scale=1.0,
             v_scale=1.0,
-        )
+            sink=s_aux)
 
     @staticmethod
     def get_scheduler_metadata(
