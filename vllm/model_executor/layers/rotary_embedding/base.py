@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Rotary Positional Embeddings Base Class."""
+from typing import Optional
 
 import torch
 
@@ -173,26 +174,48 @@ class RotaryEmbedding(CustomOp):
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor | None = None,
+        offsets: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         from vllm._ipex_ops import ipex_ops as ops
 
-        self._match_cos_sin_cache_dtype(query)
-        # ops.rotary_embedding() is an in-place operation
-        # that updates the query and key tensors.
+        # self._match_cos_sin_cache_dtype(query)
+        # # ops.rotary_embedding() is an in-place operation
+        # # that updates the query and key tensors.
+        # if key is None:
+        #     # XPU kernel doesn't support key=None so fall back to native impl
+        #     # TODO(sarckk): add support for optional key in
+        #     # ipex.llm.functional.rotary_embedding_batched
+        #     return self.forward_native(positions, query, key)
+        # else:
+        #     ops.rotary_embedding(
+        #         positions,
+        #         query,
+        #         key,
+        #         self.head_size,
+        #         self.cos_sin_cache,
+        #         self.is_neox_style,
+        #     )
+        # return query, key
+
+        self.cos_sin_cache = self.cos_sin_cache.to(positions.device,
+                                                   dtype=query.dtype)
+        # ops.rotary_embedding()/batched_rotary_embedding()
+        # are in-place operations that update the query and key tensors.
         if key is None:
             # XPU kernel doesn't support key=None so fall back to native impl
             # TODO(sarckk): add support for optional key in
             # ipex.llm.functional.rotary_embedding_batched
-            return self.forward_native(positions, query, key)
+            return self.forward_native(positions, query, key, offsets)
         else:
-            ops.rotary_embedding(
-                positions,
-                query,
-                key,
-                self.head_size,
-                self.cos_sin_cache,
-                self.is_neox_style,
-            )
+            if offsets is not None:
+                ops.batched_rotary_embedding(positions, query, key,
+                                             self.head_size,
+                                             self.cos_sin_cache,
+                                             self.is_neox_style,
+                                             self.rotary_dim, offsets)
+            else:
+                ops.rotary_embedding(positions, query, key, self.head_size,
+                                     self.cos_sin_cache, self.is_neox_style)
         return query, key
 
     def extra_repr(self) -> str:

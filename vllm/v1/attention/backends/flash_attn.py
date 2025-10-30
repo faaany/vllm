@@ -3,6 +3,7 @@
 """Attention layer with FlashAttention."""
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import torch
@@ -34,6 +35,7 @@ if is_flash_attn_varlen_func_available():
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,
 )
@@ -46,6 +48,8 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+if current_platform.is_xpu():
+    from vllm._ipex_ops import ipex_ops
 logger = init_logger(__name__)
 
 
@@ -158,7 +162,9 @@ class FlashAttentionMetadata:
     scheduler_metadata: torch.Tensor | None = None
     prefix_scheduler_metadata: torch.Tensor | None = None
     max_num_splits: int = 0
-
+    # For XPU.
+    seq_start_loc: Optional[torch.Tensor] = None
+    
     causal: bool = True
 
 
@@ -275,6 +281,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         max_query_len = common_attn_metadata.max_query_len
         max_seq_len = common_attn_metadata.max_seq_len
         query_start_loc = common_attn_metadata.query_start_loc
+        seq_start_loc = common_attn_metadata.seq_start_loc \
+            if current_platform.is_xpu() else None
         seq_lens = common_attn_metadata.seq_lens
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu
         block_table_tensor = common_attn_metadata.block_table_tensor
@@ -418,6 +426,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
             query_start_loc=query_start_loc,
+            seq_start_loc=seq_start_loc,
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
             block_table=block_table_tensor,
@@ -535,12 +544,12 @@ class FlashAttentionImpl(AttentionImpl):
 
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
-                "fused output quantization is not yet supported for FlashAttentionImpl"
-            )
+                "fused output quantization is not yet supported"
+                " for FlashAttentionImpl")
 
         if attn_metadata is None:
             # Profiling run.
-            return output.fill_(0)
+            return output.uniform_()
 
         attn_type = self.attn_type
 
@@ -559,14 +568,11 @@ class FlashAttentionImpl(AttentionImpl):
         if attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
-            return self._forward_encoder_attention(
-                query[:num_actual_tokens],
-                key[:num_actual_tokens],
-                value[:num_actual_tokens],
-                output[:num_actual_tokens],
-                attn_metadata,
-                layer,
-            )
+            return self._forward_encoder_attention(query[:num_actual_tokens],
+                                                   key[:num_actual_tokens],
+                                                   value[:num_actual_tokens],
+                                                   output[:num_actual_tokens],
+                                                   attn_metadata, layer)
 
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
@@ -574,11 +580,8 @@ class FlashAttentionImpl(AttentionImpl):
         # key and value may be None in the case of cross attention. They are
         # calculated once based on the output from the encoder and then cached
         # in KV cache.
-        if (
-            self.kv_sharing_target_layer_name is None
-            and key is not None
-            and value is not None
-        ):
+        if (self.kv_sharing_target_layer_name is None and key is not None
+                and value is not None):
             # Reshape the input keys and values and store them in the cache.
             # Skip this if sharing KV cache with an earlier attention layer.
             # NOTE(woosuk): Here, key and value are padded while slot_mapping is
@@ -598,12 +601,16 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         if self.kv_cache_dtype.startswith("fp8"):
-            # queries are quantized in the attention layer
             dtype = FlashAttentionBackend.get_fp8_dtype_for_flashattn(
-                self.kv_cache_dtype
-            )
+                self.kv_cache_dtype)
             key_cache = key_cache.view(dtype)
             value_cache = value_cache.view(dtype)
+            num_tokens, num_heads, head_size = query.shape
+            query, _ = ops.scaled_fp8_quant(
+                query.reshape(
+                    (num_tokens, num_heads * head_size)).contiguous(),
+                layer._q_scale)
+            query = query.reshape((num_tokens, num_heads, head_size))
 
         if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc
@@ -615,45 +622,33 @@ class FlashAttentionImpl(AttentionImpl):
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 
-            if self.dcp_world_size > 1:
-                self._forward_with_dcp(
-                    query[:num_actual_tokens],
-                    key[:num_actual_tokens],
-                    value[:num_actual_tokens],
-                    key_cache,
-                    value_cache,
-                    output[:num_actual_tokens],
-                    attn_metadata,
-                    q_descale=layer._q_scale.expand(descale_shape),
-                    k_descale=layer._k_scale.expand(descale_shape),
-                    v_descale=layer._v_scale.expand(descale_shape),
-                )
-                return output
-            else:
-                flash_attn_varlen_func(
-                    q=query[:num_actual_tokens],
-                    k=key_cache,
-                    v=value_cache,
-                    out=output[:num_actual_tokens],
-                    cu_seqlens_q=cu_seqlens_q,
-                    max_seqlen_q=max_seqlen_q,
-                    seqused_k=seqused_k,
-                    max_seqlen_k=max_seqlen_k,
-                    softmax_scale=self.scale,
-                    causal=attn_metadata.causal,
-                    alibi_slopes=self.alibi_slopes,
-                    window_size=self.sliding_window,
-                    block_table=block_table,
-                    softcap=self.logits_soft_cap,
-                    scheduler_metadata=scheduler_metadata,
-                    fa_version=self.vllm_flash_attn_version,
-                    q_descale=layer._q_scale.expand(descale_shape),
-                    k_descale=layer._k_scale.expand(descale_shape),
-                    v_descale=layer._v_scale.expand(descale_shape),
-                    num_splits=attn_metadata.max_num_splits,
-                    s_aux=self.sinks,
-                )
-                return output
+            cu_seqlens_k = attn_metadata.seq_start_loc if \
+                current_platform.is_xpu() else None
+            flash_attn_varlen_func(
+                q=query[:num_actual_tokens],
+                k=key_cache,
+                v=value_cache,
+                out=output[:num_actual_tokens],
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                cu_seqlens_k=cu_seqlens_k,
+                seqused_k=seqused_k,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=self.alibi_slopes,
+                window_size=self.sliding_window,
+                block_table=block_table,
+                softcap=self.logits_soft_cap,
+                scheduler_metadata=scheduler_metadata,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=layer._q_scale.expand(descale_shape),
+                k_descale=layer._k_scale.expand(descale_shape),
+                v_descale=layer._v_scale.expand(descale_shape),
+                num_splits=attn_metadata.max_num_splits,
+                s_aux=self.sinks,
+            )
+            return output
 
         # Cascade attention (rare case).
         cascade_attention(
@@ -785,8 +780,7 @@ class FlashAttentionImpl(AttentionImpl):
         # For encoder attention, process FP8 quantization if needed
         if self.kv_cache_dtype.startswith("fp8"):
             raise NotImplementedError(
-                "quantization is not supported for encoder attention"
-            )
+                "quantization is not supported for encoder attention")
 
         # Use encoder-specific metadata for sequence information
         cu_seqlens_q = attn_metadata.query_start_loc
@@ -796,8 +790,30 @@ class FlashAttentionImpl(AttentionImpl):
 
         descale_shape = (
             cu_seqlens_q.shape[0] - 1,  # type: ignore[union-attr]
-            self.num_kv_heads,
-        )
+            self.num_kv_heads)
+
+        if current_platform.is_xpu():
+            ipex_ops.varlen_attention(
+                    query=query,
+                    key=key,
+                    value=value,
+                    out=output,
+                    seqlen_q=cu_seqlens_q,
+                    seqlen_k=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=self.scale,
+                    is_causal=False,  # Encoder attention is bidirectional
+                    alibi_slopes=self.alibi_slopes,
+                    pdropout=0.0,
+                    zero_tensors=False,
+                    return_softmax=False,
+                    gen_=None,
+                    window_size_left=-1,
+                    window_size_right=-1,
+                    logits_soft_cap=self.logits_soft_cap,
+                    )
+            return output
 
         # Call flash attention directly on Q, K, V tensors
         flash_attn_varlen_func(
@@ -818,7 +834,6 @@ class FlashAttentionImpl(AttentionImpl):
             q_descale=layer._q_scale.expand(descale_shape),
             k_descale=layer._k_scale.expand(descale_shape),
             v_descale=layer._v_scale.expand(descale_shape),
-            num_splits=1 if self.batch_invariant_enabled else 0,
         )
 
         return output

@@ -1332,11 +1332,11 @@ model_example_map = {
 def run_generate(model, question: str, image_urls: list[str], seed: int | None):
     req_data = model_example_map[model](question, image_urls)
 
-    engine_args = asdict(req_data.engine_args) | {"seed": args.seed}
+    engine_args = asdict(req_data.engine_args) | {"seed": args.seed} | {"enforce_eager": True}
     llm = LLM(**engine_args)
 
     sampling_params = SamplingParams(
-        temperature=0.0, max_tokens=256, stop_token_ids=req_data.stop_token_ids
+        temperature=0.0, max_tokens=3, stop_token_ids=req_data.stop_token_ids
     )
 
     outputs = llm.generate(

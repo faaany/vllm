@@ -151,7 +151,10 @@ class ipex_ops:
     def rms_norm(
         input: torch.Tensor, weight: torch.Tensor, epsilon: float
     ) -> torch.Tensor:
-        return ipex.llm.functional.rms_norm(input, weight, epsilon)
+        out = torch.empty_like(input)
+        torch.ops.torch_ipex.rms_norm_vllm(out, input.contiguous(), weight, epsilon)
+        return out
+        #return ipex.llm.functional.rms_norm(input, weight, epsilon)
 
     @staticmethod
     def fused_add_rms_norm(
@@ -160,10 +163,11 @@ class ipex_ops:
         weight: torch.Tensor,
         epsilon: float,
     ) -> None:
-        tmp = ipex.llm.functional.add_rms_norm(
-            residual, input, weight, None, epsilon, True
-        )
-        input.copy_(tmp)
+        torch.ops.torch_ipex.fused_add_rms_norm_vllm(input, residual, weight, epsilon)
+        # tmp = ipex.llm.functional.add_rms_norm(
+        #     residual, input, weight, None, epsilon, True
+        # )
+        # input.copy_(tmp)
 
     @staticmethod
     def varlen_attention(
@@ -296,15 +300,15 @@ class ipex_ops:
         num_splits=0,
         s_aux: torch.Tensor | None = None,
     ):
-        if cu_seqlens_k is None:
-            # cu_seqlens_k is not used in ipex kernel.
-            cu_seqlens_k = torch.cumsum(seqused_k, dim=0)
-            cu_seqlens_k = torch.cat(
-                [
-                    torch.tensor([0], device=seqused_k.device, dtype=torch.int32),
-                    cu_seqlens_k,
-                ]
-            ).to(torch.int32)
+        # if cu_seqlens_k is None:
+        #     # cu_seqlens_k is not used in ipex kernel.
+        #     cu_seqlens_k = torch.cumsum(seqused_k, dim=0)
+        #     cu_seqlens_k = torch.cat(
+        #         [
+        #             torch.tensor([0], device=seqused_k.device, dtype=torch.int32),
+        #             cu_seqlens_k,
+        #         ]
+        #     ).to(torch.int32)
 
         real_window_size: tuple[int, int]
         if window_size is None:

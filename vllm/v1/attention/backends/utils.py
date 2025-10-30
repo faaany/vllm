@@ -62,6 +62,9 @@ class CommonAttentionMetadata:
     query_start_loc_cpu: torch.Tensor
     """(batch_size + 1,), the start location of each request in query Tensor"""
 
+    seq_start_loc: torch.Tensor
+    seq_start_loc_cpu: torch.Tensor
+    
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     """(batch_size,), the length of each request including both computed tokens
@@ -193,6 +196,8 @@ def _make_metadata_with_slice(
     return CommonAttentionMetadata(
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc_cpu,
+        seq_start_loc=None,
+        seq_start_loc_cpu=None,
         seq_lens=seq_lens,
         seq_lens_cpu=seq_lens_cpu,
         num_computed_tokens_cpu=num_computed_tokens_cpu,
