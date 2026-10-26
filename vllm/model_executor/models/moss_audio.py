@@ -504,11 +504,10 @@ class MossAudioEncoder(nn.Module):
             padding=(1, 1),
         )
 
-        conv_freq = self._compute_downsampled_length(
-            torch.tensor(config.num_mel_bins)
-        ).item()
+        # Use Python ints: model init may run under a meta-device context.
+        conv_freq = self._compute_downsampled_length(int(config.num_mel_bins))
         self.stem_proj = ReplicatedLinear(
-            config.downsample_hidden_size * int(conv_freq),
+            config.downsample_hidden_size * conv_freq,
             config.d_model,
             bias=True,
             quant_config=quant_config,
@@ -559,16 +558,17 @@ class MossAudioEncoder(nn.Module):
         return self.conv1.weight.dtype
 
     @staticmethod
-    def _compute_downsampled_length(lengths: torch.Tensor) -> torch.Tensor:
-        def conv_out_len(length: torch.Tensor) -> torch.Tensor:
+    def _compute_downsampled_length(
+        lengths: torch.Tensor | int,
+    ) -> torch.Tensor | int:
+        def conv_out_len(length: torch.Tensor | int) -> torch.Tensor | int:
             return (length - 1) // 2 + 1
 
         return conv_out_len(conv_out_len(conv_out_len(lengths)))
 
     @staticmethod
     def compute_num_audio_tokens(raw_mel_len: int) -> int:
-        lengths = torch.tensor(raw_mel_len, dtype=torch.long)
-        return int(MossAudioEncoder._compute_downsampled_length(lengths).item())
+        return int(MossAudioEncoder._compute_downsampled_length(int(raw_mel_len)))
 
     def _encode_chunk_batch(
         self,
